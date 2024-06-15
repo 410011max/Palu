@@ -130,10 +130,14 @@ class LlamaAttention_PALU(nn.Module):
         # self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         # self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
         
-        self.rank_k = [128, 128, 128, 128, 128, 128, 128, 128]
-        self.rank_v = 1024
-        self.group_size = 4
-        self.num_groups = 8
+        # self.rank_k = [128, 128, 128, 128, 128, 128, 128, 128]
+        # self.rank_v = 1024
+        # self.group_size = 4
+        # self.num_groups = 8
+        self.rank_k = config.rank_k
+        self.rank_v = config.rank_v
+        self.group_size = config.group_size
+        self.num_groups = config.num_groups
         self.lr_head_dim = self.head_dim * self.rank_v // self.hidden_size
         self.fused_group_dim = self.rank_v // self.num_groups
         self.fused_hidden_dim = self.fused_group_dim * self.num_heads
@@ -164,7 +168,6 @@ class LlamaAttention_PALU(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
         output_attentions: bool = False,
-        use_cache: bool = False,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         if "padding_mask" in kwargs:
@@ -204,11 +207,11 @@ class LlamaAttention_PALU(nn.Module):
             # cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
             # key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
             key_h_states, value_h_states = past_key_value.update(key_h_states, value_h_states, self.layer_idx)
-            # print(past_key_value.get_seq_length(self.layer_idx))
 
 
         if q_len > 1:
-            # print('Prompting: ', q_len)
+            # Prompting
+
             # Recompute the key states
             key_states = self.k_proj.reconstruct(key_h_states)
             key_states = key_states.view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -221,21 +224,17 @@ class LlamaAttention_PALU(nn.Module):
             # Grouped-query attention
             # key_states = repeat_kv(key_states, self.num_key_value_groups)
             # value_states = repeat_kv(value_states, self.num_key_value_groups)
+            # key_h_states = repeat_kv(key_h_states, self.num_key_value_groups)
             # value_h_states = repeat_kv(value_h_states, self.num_key_value_groups)
 
             attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
         else:
-            # print('Generating')
-            # key_states = self.k_proj.reconstruct(key_h_states)
-            # key_states = key_states.view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-            # query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-            # attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+            # Generating
             
             # Apply our reconsturction kernel
             # A: (num_heads, 1, head_dim)
             # B: (num_heads, rank_per_groups, head_dim)
             # X: (num_head_groups, seq_len, rank_per_groups)
-            # key_h_states = key_h_states.view(bsz, kv_seq_len, self.num_groups, self.rank_k[0]).transpose(1, 2)
             A = query_states.squeeze(0)
             B = self.k_proj.U.view(self.num_heads, self.rank_k[0], self.head_dim)
             X = key_h_states.squeeze(0)
@@ -263,11 +262,10 @@ class LlamaAttention_PALU(nn.Module):
 
         attn_weights = attn_weights.reshape(bsz, self.num_groups, q_len * self.group_size, kv_seq_len)
         attn_output = torch.matmul(attn_weights, value_h_states)
-        # attn_output = attn_output.reshape(bsz, self.num_heads, q_len, self.fused_group_dim)
+
 
         attn_output = attn_output.transpose(1, 2).contiguous()
-        # attn_output = attn_output.reshape(bsz, q_len, -1)
-        attn_output = attn_output.reshape(bsz, q_len, self.fused_hidden_dim)
+        attn_output = attn_output.reshape(bsz, q_len, -1)
 
         attn_output = self.o_proj(attn_output)
         
