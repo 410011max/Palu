@@ -12,8 +12,8 @@ from datetime import datetime
 from torch.autograd.profiler import record_function
 
 from transformers.models.llama.modeling_llama import LlamaConfig, DynamicCache, LlamaAttention
-from models.llama_attention_palu import LlamaAttention_PALU
-
+from models.llama_attention_palu import LlamaAttention_PALU, LlamaAttention_PALU_no_rope
+from models.palu_attention import LlamaPaluAttention#, LlamaPaluAttentionNoRoPE
 
 TIME_FORMAT_STR: str = "%b_%d_%H_%M_%S"
 
@@ -53,9 +53,27 @@ def build_attention_palu(args):
     config.rank_k = [args.rank_k // config.num_groups for _ in range(config.num_groups)]
     config.rank_v = args.rank_v
     logging.info(f"rank_k: {config.rank_k}, rank_v: {config.rank_v}, group_size: {config.group_size}, num_groups: {config.num_groups}")
-    attention_palu = LlamaAttention_PALU(config, layer_idx=0).to(dtype).to(device)
+    # attention_palu = LlamaAttention_PALU(config, layer_idx=0).to(dtype).to(device)
+    attention_palu = LlamaPaluAttention(config, layer_idx=0).to(dtype).to(device)
     
     return attention_palu, config
+
+def build_attention_palu_no_rope(args):
+    device = "cuda:0"
+    dtype = torch.float16
+
+    logging.info(f"Creating Attention_Palu (w/o RoPE), dtype: {dtype}, device: {device}")
+    config = LlamaConfig()
+    config.max_position_embeddings = 300000
+    config.group_size = args.group_size
+    config.num_groups = config.num_attention_heads // args.group_size
+    config.rank_k = args.rank_k
+    config.rank_v = args.rank_v
+    logging.info(f"rank_k: {config.rank_k}, rank_v: {config.rank_v}, group_size: {config.group_size}, num_groups: {config.num_groups}")
+    attention_palu_no_rope = LlamaAttention_PALU_no_rope(config, layer_idx=0).to(dtype).to(device)
+    # attention_palu_no_rope = LlamaPaluAttentionNoRoPE(config, layer_idx=0).to(dtype).to(device)
+    
+    return attention_palu_no_rope, config
 
 def profile_tpot(model, cache_size_k, cache_size_v, cache_type=torch.float16, batch_size=1, prompt_len=1024, repeats=100,
                  cache_graph=False, torch_profile=False, outfile=""):
@@ -146,6 +164,19 @@ def main(args):
         cache_size_k = (args.batch_size, num_groups, args.prompt_len, group_dim_k)
         cache_size_v = (args.batch_size, num_groups, args.prompt_len, group_dim_v)
         profile_tpot(attention, cache_size_k, cache_size_v, torch.float16, args.batch_size, args.prompt_len, args.repeats, args.cache_graph, args.torch_profile, "tpot_palu_fp16")
+    elif args.palu_no_rope:
+        attention, config = build_attention_palu_no_rope(args)
+        attention.eval()
+
+        num_groups = config.num_groups
+        # NOTE: Assuming uniform head_dim
+        group_dim_k = config.rank_k // config.num_groups 
+        group_dim_v = config.rank_v // config.num_groups 
+        # key_h_states = key_h_states.view(bsz, q_len, num_groups, fused_group_dim).transpose(1, 2)
+        # value_h_states = value_h_states.view(bsz, q_len, num_groups, fused_group_dim).transpose(1, 2)
+        cache_size_k = (args.batch_size, num_groups, args.prompt_len, group_dim_k)
+        cache_size_v = (args.batch_size, num_groups, args.prompt_len, group_dim_v)
+        profile_tpot(attention, cache_size_k, cache_size_v, torch.float16, args.batch_size, args.prompt_len, args.repeats, args.cache_graph, args.torch_profile, "tpot_palu_fp16")
     else:
         attention, config = build_attention(args)
         attention.eval()
@@ -162,6 +193,10 @@ if __name__ =='__main__':
     parser.add_argument(
         '--palu', action='store_true',
         help='Whether to use PALU attention.'
+    )
+    parser.add_argument(
+        '--palu_no_rope', action='store_true',
+        help='Whether to use PALU attention without ROPE.'
     )
     parser.add_argument(
         '--rank_k', type=int, default=1024,
