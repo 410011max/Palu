@@ -26,7 +26,9 @@ def get_configs():
                         triton.Config({'BLOCK_SIZE_L': block_l, 'BLOCK_SIZE_R': block_r},
                                 num_stages=num_stages, num_warps=num_warps))
     # return configs
-    return [triton.Config({'BLOCK_SIZE_L': 64, 'BLOCK_SIZE_R': 16}, num_warps=4, num_stages=3)]
+    # return [triton.Config({'BLOCK_SIZE_L': 128, 'BLOCK_SIZE_R': 32}, num_warps=4, num_stages=3)] # for gs=4
+    # return [triton.Config({'BLOCK_SIZE_L': 64, 'BLOCK_SIZE_R': 32}, num_warps=4, num_stages=3)] # for gs=2
+    return [triton.Config({'BLOCK_SIZE_L': 64, 'BLOCK_SIZE_R': 32}, num_warps=4, num_stages=1)] # for gs=1
 
 @triton.autotune(
     configs= get_configs(),
@@ -48,7 +50,7 @@ def _abx_fwd(
     RBE_EPILOGUE: tl.constexpr,
     THETA: tl.constexpr,
 ):
-    pid_h = tl.program_id(axis=0) * 2  # number of heads
+    pid_h = tl.program_id(axis=0)  # number of heads
     pid_l = tl.program_id(axis=1)  # nubmer of block along seq_length dimension
     
     # Assuming NUM_HEAD_GROUPS = 4, then pid_h = 0, 1, 2, 3 will be assigned to head group 0
@@ -57,38 +59,29 @@ def _abx_fwd(
     offs_rs  = tl.arange(0, BLOCK_SIZE_R)
     offs_ls = (pid_l * BLOCK_SIZE_L) + tl.arange(0, BLOCK_SIZE_L)
     
-    # Reuse KV cache to compute N group
     A_ptrs = a_ptr + pid_h * stride_az + (0*stride_aa + offs_ds[None, :]*stride_ad) # assume a is always (bs, 1, d)
     B_ptrs = b_ptr + pid_h * stride_bz + (offs_rs[:, None]*stride_br + offs_ds[None, :]*stride_bd)
     X_ptrs = x_ptr + HEAD_GROUPS_ID * stride_xhg + (offs_ls[:, None]*stride_xl + offs_rs[None, :]*stride_xr)
     O_ptrs = out_ptr + pid_h * stride_oz + (0*stride_oa + offs_ls[None, :]*stride_ol)
     # debug_ptrs = debug_ptr + pid_h * stride_dz + (offs_ls[:, None]*stride_dl + offs_ds[None, :]*stride_dd)
     
-    # Fix BLOCK_SIZE_D = DIM // 2 = 64
-    xb_0_0 = tl.zeros((BLOCK_SIZE_L, BLOCK_SIZE_D), dtype=tl.float32)
-    xb_0_1 = tl.zeros((BLOCK_SIZE_L, BLOCK_SIZE_D), dtype=tl.float32)
-    xb_1_0 = tl.zeros((BLOCK_SIZE_L, BLOCK_SIZE_D), dtype=tl.float32)
-    xb_1_1 = tl.zeros((BLOCK_SIZE_L, BLOCK_SIZE_D), dtype=tl.float32)
+    # BLOCK_SIZE_D = 64
+    xb_0 = tl.zeros((BLOCK_SIZE_L, BLOCK_SIZE_D), dtype=tl.float32)
+    xb_1 = tl.zeros((BLOCK_SIZE_L, BLOCK_SIZE_D), dtype=tl.float32)
     for _ in range(0, tl.cdiv(R, BLOCK_SIZE_R)):
         # Load next block of B, X
         x = tl.load(X_ptrs)
-        b_0_0 = tl.load(B_ptrs)
-        b_0_1 = tl.load(B_ptrs + BLOCK_SIZE_D * stride_bd)
-        b_1_0 = tl.load(B_ptrs + stride_bz)
-        b_1_1 = tl.load(B_ptrs + stride_bz + BLOCK_SIZE_D * stride_bd)
+        b_0 = tl.load(B_ptrs)
+        b_1 = tl.load(B_ptrs + BLOCK_SIZE_D * stride_bd)
         # Accumulate along R dimension.
-        xb_0_0 = tl.dot(x, b_0_0, xb_0_0)
-        xb_0_1 = tl.dot(x, b_0_1, xb_0_1)
-        xb_1_0 = tl.dot(x, b_1_0, xb_1_0)
-        xb_1_1 = tl.dot(x, b_1_1, xb_1_1)
+        xb_0 = tl.dot(x, b_0, xb_0)
+        xb_1 = tl.dot(x, b_1, xb_1)
         # Advance the pointers to next blocks
         B_ptrs += BLOCK_SIZE_R * stride_br
         X_ptrs += BLOCK_SIZE_R * stride_xr
     
-    xb_0_0 = xb_0_0.to(tl.float16)
-    xb_0_1 = xb_0_1.to(tl.float16)
-    xb_1_0 = xb_1_0.to(tl.float16)
-    xb_1_1 = xb_1_1.to(tl.float16)
+    xb_0 = xb_0.to(tl.float16)
+    xb_1 = xb_1.to(tl.float16)
     
     # RoPE
     # if RBE_EPILOGUE:
@@ -97,29 +90,17 @@ def _abx_fwd(
     cos = cos.to(tl.float16)
     sin = sin.to(tl.float16)
 
-    xb_rope_0_0 = xb_0_0 * cos - xb_0_1 * sin
-    xb_rope_0_1 = xb_0_1 * cos + xb_0_0 * sin
-    xb_rope_1_0 = xb_1_0 * cos - xb_1_1 * sin
-    xb_rope_1_1 = xb_1_1 * cos + xb_1_0 * sin
-    xb_0_0 = xb_rope_0_0.to(tl.float16)
-    xb_0_1 = xb_rope_0_1.to(tl.float16)
-    xb_1_0 = xb_rope_1_0.to(tl.float16)
-    xb_1_1 = xb_rope_1_1.to(tl.float16)
-        
+    xb_rope_0 = xb_0 * cos - xb_1 * sin
+    xb_rope_1 = xb_1 * cos + xb_0 * sin
+    xb_0 = xb_rope_0.to(tl.float16)
+    xb_1 = xb_rope_1.to(tl.float16)
 
-    a_0_0 = tl.load(A_ptrs)
-    a_0_1 = tl.load(A_ptrs + BLOCK_SIZE_D * stride_ad)
-    a_1_0 = tl.load(A_ptrs + stride_az)
-    a_1_1 = tl.load(A_ptrs + stride_az + BLOCK_SIZE_D * stride_ad)
-    abx_0_0 = tl.sum(a_0_0 * xb_0_0, 1)
-    abx_0_1 = tl.sum(a_0_1 * xb_0_1, 1)
-    abx_1_0 = tl.sum(a_1_0 * xb_1_0, 1)
-    abx_1_1 = tl.sum(a_1_1 * xb_1_1, 1)
-    abx_0 = abx_0_0 + abx_0_1
-    abx_1 = abx_1_0 + abx_1_1
-    tl.store(O_ptrs, abx_0[None, :])
-    tl.store(O_ptrs + stride_az, abx_1[None, :])
-    
+    a_0 = tl.load(A_ptrs)
+    a_1 = tl.load(A_ptrs + BLOCK_SIZE_D * stride_ad)
+    abx_0 = tl.sum(a_0 * xb_0, 1)
+    abx_1 = tl.sum(a_1 * xb_1, 1)
+    abx = abx_0 + abx_1
+    tl.store(O_ptrs, abx[None, :])
 
     
 def abx(a: torch.Tensor, b: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
@@ -133,7 +114,7 @@ def abx(a: torch.Tensor, b: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     num_head_groups, seq_len, rank_per_head_groups = x.shape
     # Allocate output tensor
     out = torch.empty((num_heads, 1, seq_len), dtype=x.dtype, device=x.device)
-    # debug = torch.empty((num_heads, seq_len, 64), dtype=x.dtype, device=x.device)
+    debug = torch.empty((num_heads, seq_len, 64), dtype=x.dtype, device=x.device)
     BLOCK_SIZE_D = 64
     # BLOCK_SIZE_R = 32
     # BLOCK_SIZE_L = 128
@@ -141,9 +122,10 @@ def abx(a: torch.Tensor, b: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     # num_warps = 8
     NUM_HEAD_GROUPS = num_head_groups
     
-    grid = lambda META: (NUM_HEAD_GROUPS, triton.cdiv(seq_len, META["BLOCK_SIZE_L"]))
+    grid = lambda META: (32, triton.cdiv(seq_len, META["BLOCK_SIZE_L"]))
+    #grid = lambda META: (triton.cdiv(seq_len, BLOCK_SIZE_L), 32)
     _abx_fwd[grid](
-        a, b, x, out, # debug,
+        a, b, x, out, #debug,
         a.stride(0), a.stride(1), a.stride(2),
         b.stride(0), b.stride(1), b.stride(2),
         x.stride(0), x.stride(1), x.stride(2),
@@ -164,10 +146,10 @@ def abx(a: torch.Tensor, b: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     return out #, debug
 
 def torch_abx(a, b, x):
-    from pytorch_reference import LlamaRotaryEmbedding, apply_rotary_pos_emb_pytorch
     x = x.repeat_interleave(b.shape[0]//x.shape[0], dim=0)
     xb = x @ b
     # (seq_len, 128) -> 0~63 is the same as 64~127
+    from pytorch_reference import LlamaRotaryEmbedding, apply_rotary_pos_emb_pytorch
     cos, sin, freqs = LlamaRotaryEmbedding(dim=128, end=x.shape[1])
     xb_rope, xb_rope_0, xb_rope_1 = apply_rotary_pos_emb_pytorch(x=xb, cos=cos, sin=sin)
     axb = a @ xb_rope.transpose(-1, -2).to(torch.float16)
@@ -202,7 +184,6 @@ def run_benchmark(args):
         warmup = 25
         rep = 100
         A = torch.randn(num_heads, 1, head_dim, dtype=dtype, device=device)
-        # from pytorch_reference import rotate_half
         # Ar = rotate_half(A)
         B = torch.randn(num_heads, rank_per_groups, head_dim, dtype=dtype, device=device)
         X = torch.randn(num_head_groups, seq_len, rank_per_groups, dtype=dtype, device=device)
@@ -245,18 +226,19 @@ def run_test(args):
     device = "cuda"
     
     A = torch.randn(num_heads, 1, head_dim, dtype=dtype, device=device)
-    # from pytorch_reference import rotate_half
     # Ar = rotate_half(A)
     B = torch.randn(num_heads, rank_per_groups, head_dim, dtype=dtype, device=device)
     X = torch.randn(num_head_groups, seq_len, rank_per_groups, dtype=dtype, device=device)
     
     x, xb, xb_rope, xb_rope_0, xb_rope_1, axb, cos, sin, freqs = torch_abx(A, B, X)
-    ours, debug = abx(A, B, X)
+    # ours, debug = abx(A, B, X)
+    ours, = abx(A, B, X)
+
     # print('freq', freqs.shape, freqs[1, :3])
     # print('b_0', B.shape, B[0, 1, :3])
     # print('b_1', B.shape, B[0, 1, 64:67])
-    # print('xb_0_0', xb.shape, xb[0, 1, :3])
-    # print('xb_0_1', xb.shape, xb[0, 1, 64:67])
+    # print('xb_0', xb.shape, xb[0, 1, :3])
+    # print('xb_1', xb.shape, xb[0, 1, 64:67])
     # print('sin', sin.shape, sin[1, :3])
     # print('cos', cos.shape, cos[1, :3])
     # print('xb_rope_0', xb_rope_0.shape, xb_rope_0[0, 1, :3])
@@ -276,8 +258,9 @@ def parse_args():
     parser.add_argument("--head_dim", type=int, default=128, help="Head dimension, default to 128 (llama)")
     parser.add_argument("--num_head_groups", type=int, default=16, help="Number of head groups")
     parser.add_argument("--target_seq_lens", nargs="+", type=int, 
-                        default=[128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144], help="Target sequence lengths")
-    parser.add_argument("--check", action="store_true", default=False, help="Check the correctness of the implementation")
+                        default=[4096, 16384, 65536, 262144], help="Target sequence lengths")
+                        # default=[128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144], help="Target sequence lengths")
+    parser.add_argument("--check", action="store_true", help="Check the correctness of the implementation")
     args = parser.parse_args()
     return args
 
