@@ -25,6 +25,12 @@ def config():
     config.total_rank_v = 4096
     return config
 
+def _set_random_seed():
+    torch.manual_seed(0)
+    torch.cuda.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 def test_init():
     batch_size = 1
@@ -146,7 +152,7 @@ def test_palu_attention_kernel(config):
     _, golden_attn_weights, _ = attention(inputs, output_attentions=True)
     
     # Test kernel
-    _, kernel_attn_weights, _ = palu_attention(inputs, output_attentions=True, golden_fusion=True)
+    _, kernel_attn_weights, _ = palu_attention(inputs, output_attentions=True, golden_kernel=True, golden_fusion=True)
     
     torch.testing.assert_close(golden_attn_weights, kernel_attn_weights, rtol=1e-5, atol=1e-5)
 
@@ -174,11 +180,12 @@ def test_palu_attention_fusion(config):
 
 if __name__ == "__main__":
     # pytest.main()
+    _set_random_seed()
     _config = LlamaConfig()
     _config.group_size = 4
     _config.num_groups = _config.num_attention_heads // 4
     _config.total_rank_k = 4096
     _config.total_rank_v = 4096
-    test_palu_attention_kernel(_config)
     # test_palu_attention_fusion(_config)
+    test_palu_attention_kernel(_config)
     
