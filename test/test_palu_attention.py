@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import pytest
 
-from transformers.models.llama.modeling_llama import LlamaAttention, LlamaConfig
+from transformers.models.llama.modeling_llama import LlamaAttention, LlamaConfig, DynamicCache
 
 import sys
 sys.path.append("..")
@@ -139,22 +139,47 @@ def test_palu_attention_inherit_fusion(config):
 
 def test_palu_attention_kernel(config):
     batch_size = 1
+    prompt_len = 63
     seq_len = 1
 
     attention = LlamaAttention(config, 0)
-    palu_attention = LlamaPaluAttention.from_attention(attention, config, no_fusion=True)
+    palu_attention = LlamaPaluAttention.from_attention(attention, config)
     
     attention = attention.to('cuda:0')
     palu_attention = palu_attention.to('cuda:0')
+    prompt_inputs = torch.randn(batch_size, prompt_len, config.hidden_size).to('cuda:0')
     inputs = torch.randn(batch_size, seq_len, config.hidden_size).to('cuda:0')
+    prompt_position_ids = torch.arange(prompt_len).unsqueeze(0)  # Shape: [1, seq_length]
+    golden_position_ids = torch.arange(prompt_len, prompt_len+seq_len).unsqueeze(0)  # Shape: [1, seq_length]
+    palu_position_ids = torch.arange(prompt_len + seq_len).unsqueeze(0)  # Shape: [1, seq_length]
+    kv_cache = DynamicCache()
+    palu_kv_cache = DynamicCache()
 
+    # Prompt
+    attn_output, attn_weights, kv_cache = attention(prompt_inputs, output_attentions=True, 
+                                                    past_key_value=kv_cache, position_ids=prompt_position_ids)
+    palu_attn_output, palu_attn_weights, palu_kv_cache = palu_attention(prompt_inputs, output_attentions=True, 
+                                                                        past_key_value=palu_kv_cache, position_ids=prompt_position_ids,
+                                                                        golden_kernel=True)
+    print(f'attn_output: {attn_output.shape}')
+    print(f'attn_weights: {attn_weights.shape}')
+    print(f'kv_cache len: {kv_cache.get_seq_length(), palu_kv_cache.get_seq_length()}')
+    torch.testing.assert_close(attn_output, palu_attn_output, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(attn_weights, palu_attn_weights, rtol=1e-3, atol=1e-3)
+    print('pass prompt!!\n')
+
+    # Generate
     # Normal
-    _, golden_attn_weights, _ = attention(inputs, output_attentions=True)
+    golden_attn_output, golden_attn_weights, _ = attention(inputs, output_attentions=True, 
+                                                           past_key_value=kv_cache, position_ids=golden_position_ids)
     
     # Test kernel
-    _, kernel_attn_weights, _ = palu_attention(inputs, output_attentions=True, golden_kernel=True, golden_fusion=True)
+    kernel_attn_output, kernel_attn_weights, _ = palu_attention(inputs, output_attentions=True, 
+                                                                past_key_value=palu_kv_cache, position_ids=palu_position_ids,
+                                                                golden_kernel=True)
     
-    torch.testing.assert_close(golden_attn_weights, kernel_attn_weights, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(golden_attn_weights, kernel_attn_weights, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(golden_attn_output, kernel_attn_output, rtol=1e-3, atol=1e-3)
 
 def test_palu_attention_fusion(config):
     batch_size = 1

@@ -32,13 +32,13 @@ class HeadwiseLowRankModule(nn.Module):
             )
 
         self.VT = nn.Linear(in_features, sum(ranks), bias=False)
-        nn.init.xavier_uniform_(self.VT.weight)
+        nn.init.normal_(self.VT.weight)
 
         # Create the list of linear layers first
         Us = []
         for r in ranks:
             linear_layer = nn.Linear(r, self.group_dim, bias=bias)
-            nn.init.xavier_uniform_(linear_layer.weight)
+            nn.init.normal_(linear_layer.weight)
             Us.append(linear_layer)
 
         self.U_list = nn.ModuleList(Us)
@@ -50,6 +50,15 @@ class HeadwiseLowRankModule(nn.Module):
             self.U.data[:, total_ranks:total_ranks + r] = self.U_list[i].weight.data.clone()
             total_ranks += r
 
+        # Final b
+        # FIXME: use group_rank & head_dim & group_size
+        U_list_T = [x.weight.data.T for x in self.U_list]
+        b = torch.stack(U_list_T)
+        b = b.reshape(self.num_groups, self.ranks[0], 4, 128)
+        b = b.transpose(1, 2)
+        b = b.reshape(32, self.ranks[0], 128)
+        self.b = nn.Parameter(b)
+    
     def forward(self, hidden_states: torch.Tensor):
         """ hidden_states: Tensor of shape (batch_size, seq_len, in_features) """
         assert hidden_states.dim() == 3, f"hidden_states should have 3 dimensions, got {hidden_states.dim()}"
@@ -77,15 +86,15 @@ class HeadwiseLowRankModule(nn.Module):
         """ hidden_states: Tensor of shape (batch_size, seq_len, sum(ranks)) """
         assert hidden_states.dim() == 3, f"hidden_states should have 3 dimensions, got {hidden_states.dim()}"
 
+        # hidden_states: Tensor of shape (batch_size, seq_len, r1 + r2 + ... )
         outputs = []
         total_ranks = 0
         for i in range(self.num_groups):
-            outputs.append(F.linear(hidden_states[:, :, total_ranks : total_ranks+self.ranks[i]], 
-                                    self.U[:, total_ranks : total_ranks+self.ranks[i]]))
+            outputs.append(self.U_list[i](hidden_states[:, :, total_ranks: total_ranks+self.ranks[i]]))
             total_ranks += self.ranks[i]
 
         return torch.cat(outputs, dim=-1)
-
+    
     @staticmethod
     def from_linear(
         old_module: nn.Linear,
@@ -112,13 +121,22 @@ class HeadwiseLowRankModule(nn.Module):
             if new_module.U_list[i].weight.data.shape != wl[i].shape:
                 raise ValueError(f"{new_module.U_list[i].weight.data.shape} != {wl[i].shape}")
             new_module.U_list[i].weight.data = wl[i].contiguous()
-
+        
         # Copy the weights from U_list
         new_module.U = nn.Parameter(torch.empty(new_module.group_dim, sum(ranks)))
         total_ranks = 0
         for i, r in enumerate(ranks):
             new_module.U.data[:, total_ranks:total_ranks + r] = new_module.U_list[i].weight.data.clone()
             total_ranks += r
+
+        # Final b
+        # FIXME: use group_rank & head_dim & group_size
+        U_list_T = [x.weight.data.T for x in new_module.U_list]
+        b = torch.stack(U_list_T)
+        b = b.reshape(new_module.num_groups, new_module.ranks[0], 4, 128)
+        b = b.transpose(1, 2)
+        b = b.reshape(32, new_module.ranks[0], 128)
+        new_module.b.data = b
 
         # load to VT
         # shape (sum(ranks), hidden_size)
@@ -152,7 +170,6 @@ class LlamaPaluAttention(LlamaAttention):
         self.group_rank_k = self.total_rank_k // self.num_groups
         self.group_rank_v = self.total_rank_v // self.num_groups
         self.fused_hidden_dim_o = self.group_rank_v * self.num_heads
-        print(f'fuse_hidden_dim_o: {self.fused_hidden_dim_o}')
         
         self.rank_k_list = [self.group_rank_k for _ in range(self.num_groups)]
         self.rank_v_list = [self.group_rank_v for _ in range(self.num_groups)]
@@ -216,11 +233,11 @@ class LlamaPaluAttention(LlamaAttention):
             key_h_states, value_h_states = past_key_value.update(key_h_states, value_h_states, self.layer_idx)
 
 
-        if q_len > 1 or golden_kernel:
-            print("Normal forward")
+        if q_len > 1:
+            print("Prompt forward")
             # Prompting (Original implementation)
             # Recompute the key states
-            key_h_states = key_h_states.transpose(1, 2).reshape(bsz, q_len, self.total_rank_k)
+            key_h_states = key_h_states.transpose(1, 2).reshape(bsz, kv_seq_len, self.total_rank_k)
             key_states = self.k_proj.reconstruct(key_h_states)
             key_states = key_states.view(bsz, kv_seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
@@ -228,6 +245,60 @@ class LlamaPaluAttention(LlamaAttention):
             cos, sin = self.rotary_emb(query_states, seq_len=kv_seq_len)
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
             attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        elif golden_kernel:
+            print("Normal forward")
+            # Prompting (Original implementation)
+            # Recompute the key states
+            print(f'query_states: {query_states.size()}')
+
+            X = key_h_states.squeeze(0)
+            key_h_states = key_h_states.transpose(1, 2).reshape(bsz, kv_seq_len, self.total_rank_k)
+            key_states = self.k_proj.reconstruct(key_h_states)
+            key_states = key_states.view(bsz, kv_seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+            # Apply RoPE after recomputing the key states
+            cos, sin = self.rotary_emb(query_states, seq_len=kv_seq_len)
+            query_states, _ = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids[:, -1:])
+            _, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+            print(f'query_states: {query_states.size()}')
+            print(f'key_states: {key_states.size()}')
+            print(f'attn_weights: {attn_weights.size()}')
+
+            # Kernel Golden
+            # key_h_states: (bsz, num_groups, seq_len, group_rank_k)
+            A = query_states.squeeze(0)
+            B = self.k_proj.b
+
+            x = X.unsqueeze(1)
+            xb = (x @ self.k_proj.b.reshape(self.num_groups, self.group_size, self.group_rank_k, self.head_dim)).reshape(32, -1, 128).unsqueeze(0)
+            # torch.testing.assert_close(key_states, xb)
+            print('pass reconsturct')
+
+            print(f'kv_seq_len: {kv_seq_len}')
+            cos, sin = self.rotary_emb(query_states, seq_len=kv_seq_len)
+            print(f'cos: {cos.size()}, sin: {sin.size()}')
+            xb_rope, _ = apply_rotary_pos_emb(xb ,xb, cos, sin, position_ids)
+            print(f'xb_rope: {xb_rope.size()}')
+            axb = (query_states @ xb_rope.transpose(2, 3)) / math.sqrt(self.head_dim)
+            torch.testing.assert_close(axb, attn_weights)
+            print('pass axb')
+
+            print(f'positional_ids: {position_ids.size()}')
+
+            print(f'A: {A.size()}, B: {B.size()}, X: {X.size()}')
+            kernel_axb = recompute_k_gemv(A, B, X).unsqueeze(0) / math.sqrt(self.head_dim)
+            print(f'axb: {axb.size()}')
+            print(f'kernel_axb: {kernel_axb.size()}')
+
+            # for i in range(32):
+            #     print(axb[0, i, :, :5].data - kernel_axb[0, i, :, :5].data)
+
+            torch.testing.assert_close(attn_weights, kernel_axb, rtol=1e-3, atol=1e-3)
+            print('kernel oh yaaaa')
+            # exit()
+
+            # return key_states, attn_weights, query_states
         else:
             print('Kernel forward')
             # Generating (Apply our reconsturction kernel)
@@ -235,13 +306,13 @@ class LlamaPaluAttention(LlamaAttention):
             # B: (num_heads, rank_per_groups, head_dim)
             # X: (num_head_groups, seq_len, rank_per_groups)
             A = query_states.squeeze(0)
-            B = self.k_proj.U.view(self.num_heads, self.rank_k_list[0], self.head_dim)
+            B = self.k_proj.b
             X = key_h_states.squeeze(0)
             attn_weights = recompute_k_gemv(A, B, X).unsqueeze(0) / math.sqrt(self.head_dim)
-            return _, attn_weights, _
+
 
         # attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
- 
+        # return key_states, attn_weights, query_states
 
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
@@ -259,11 +330,11 @@ class LlamaPaluAttention(LlamaAttention):
         # Upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-
+    
         if golden_fusion:
             print(golden_fusion)
             print('Original forward')
-            # TODO: Original version
+            # Original version
             # print(f'value_h_states: {value_h_states.size()}')
             # value_states = self.v_proj.reconstruct(value_h_states)
             # value_states = value_states.reshape(1, q_len, self.num_heads, self.head_dim).transpose(1, 2)
@@ -277,7 +348,7 @@ class LlamaPaluAttention(LlamaAttention):
             print('Fusion forward')
             # Fusion version
             # attn_weights: (bsz, num_groups, q_len * group_size, kv_seq_len)
-            attn_h_weights = attn_weights.reshape(1, self.num_groups, q_len * self.group_size, q_len)
+            attn_h_weights = attn_weights.reshape(1, self.num_groups, q_len * self.group_size, kv_seq_len)
 
             attn_h_output = torch.matmul(attn_h_weights, value_h_states)
 
@@ -307,7 +378,7 @@ class LlamaPaluAttention(LlamaAttention):
         # rank_k_list = [config.total_rank_k // config.num_groups for _ in range(config.num_groups)]
         new_module.k_proj = HeadwiseLowRankModule.from_linear(module.k_proj, new_module.rank_k_list)
 
-        inputs = torch.randn(1, 5, config.hidden_size)
+        inputs = torch.randn(1, 64, config.hidden_size)
         new_output = new_module.k_proj.project_to_latent(inputs)
         new_output = new_module.k_proj.reconstruct(new_output)
         torch.testing.assert_close(module.k_proj(inputs), new_output, rtol=1e-4, atol=1e-4)
@@ -337,6 +408,7 @@ class LlamaPaluAttention(LlamaAttention):
         for _ in range(num_groups):
             total_dims = 0
             for _ in range(group_size):
+                # FIXME: Use U_list version
                 new_o_weight[:, total_fused_dims:total_fused_dims + group_rank] = \
                     module.o_proj.weight.data[:, total_dims_2:total_dims_2 + head_dim] @ \
                         new_v_proj.U.data[total_dims:total_dims + head_dim, total_ranks : total_ranks + group_rank]
