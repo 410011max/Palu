@@ -205,7 +205,7 @@ class LlamaPaluAttention(LlamaAttention):
 
 
         if q_len > 1:
-            print("Prompt forward")
+            # print("Prompt forward")
             # Prompting (Original implementation)
             # Recompute the key states
             key_h_states = key_h_states.transpose(1, 2).reshape(bsz, kv_seq_len, self.total_rank_k)
@@ -217,7 +217,7 @@ class LlamaPaluAttention(LlamaAttention):
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
             attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
         elif golden_kernel:
-            print("Normal forward")
+            # print("Normal forward")
             # Recompute the key states
             X = key_h_states.squeeze(0)
             key_h_states = key_h_states.transpose(1, 2).reshape(bsz, kv_seq_len, self.total_rank_k)
@@ -245,11 +245,13 @@ class LlamaPaluAttention(LlamaAttention):
             kernel_axb = recompute_k_gemv(A, B, X).unsqueeze(0) / math.sqrt(self.head_dim)
             torch.testing.assert_close(attn_weights, kernel_axb, rtol=1e-3, atol=1e-3)
         else:
-            print('Final Kernel forward')
+            # print('Final Kernel forward')
             # Generating (Apply our reconsturction kernel)
             # A: (num_heads, 1, head_dim)
             # B: (num_heads, rank_per_groups, head_dim)
             # X: (num_head_groups, seq_len, rank_per_groups)
+            # TODO: Optimize RoPE & sqrt(head_dim) into kernel
+            # TODO: Check if sin & cos are share among different blocks
             cos, sin = self.rotary_emb(query_states, seq_len=kv_seq_len)
             query_states, _ = apply_rotary_pos_emb(query_states, query_states, cos, sin, position_ids)
             A = query_states.squeeze(0)
