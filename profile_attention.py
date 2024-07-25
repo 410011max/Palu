@@ -37,7 +37,7 @@ def build_attention(args):
     logging.info(f"Creating Attention, dtype: {dtype}, device: {device}")
     config = LlamaConfig()
     config.max_position_embeddings = 300000
-    attention = LlamaAttention(config, layer_idx=0).to(dtype).to(device)
+    attention = LlamaAttention(config, layer_idx=0).to(device, dtype)
     
     return attention, config
 
@@ -50,11 +50,12 @@ def build_attention_palu(args):
     config.max_position_embeddings = 300000
     config.group_size = args.group_size
     config.num_groups = config.num_attention_heads // args.group_size
-    config.rank_k = [args.rank_k // config.num_groups for _ in range(config.num_groups)]
-    config.rank_v = args.rank_v
-    logging.info(f"rank_k: {config.rank_k}, rank_v: {config.rank_v}, group_size: {config.group_size}, num_groups: {config.num_groups}")
-    # attention_palu = LlamaAttention_PALU(config, layer_idx=0).to(dtype).to(device)
-    attention_palu = LlamaPaluAttention(config, layer_idx=0).to(dtype).to(device)
+    config.total_rank_k = args.rank_k
+    config.total_rank_v = args.rank_v
+    logging.info(f"rank_k: {config.total_rank_k}, rank_v: {config.total_rank_v}, group_size: {config.group_size}, num_groups: {config.num_groups}")
+    # attention_palu = LlamaAttention_PALU(config, layer_idx=0).to(device, dtype)
+    attention = LlamaAttention(config, layer_idx=0)
+    attention_palu = LlamaPaluAttention.from_attention(attention, config).to(device, dtype)
     
     return attention_palu, config
 
@@ -70,8 +71,8 @@ def build_attention_palu_no_rope(args):
     config.rank_k = args.rank_k
     config.rank_v = args.rank_v
     logging.info(f"rank_k: {config.rank_k}, rank_v: {config.rank_v}, group_size: {config.group_size}, num_groups: {config.num_groups}")
-    attention_palu_no_rope = LlamaAttention_PALU_no_rope(config, layer_idx=0).to(dtype).to(device)
-    # attention_palu_no_rope = LlamaPaluAttentionNoRoPE(config, layer_idx=0).to(dtype).to(device)
+    attention_palu_no_rope = LlamaAttention_PALU_no_rope(config, layer_idx=0).to(device, dtype)
+    # attention_palu_no_rope = LlamaPaluAttentionNoRoPE(config, layer_idx=0).to(device, dtype)
     
     return attention_palu_no_rope, config
 
@@ -157,8 +158,8 @@ def main(args):
 
         num_groups = config.num_groups
         # NOTE: Assuming uniform head_dim
-        group_dim_k = config.rank_k[0]
-        group_dim_v = config.rank_v // config.num_groups 
+        group_dim_k = config.total_rank_k // config.num_groups 
+        group_dim_v = config.total_rank_v // config.num_groups 
         # key_h_states = key_h_states.view(bsz, q_len, num_groups, rank_k[0]).transpose(1, 2)
         # value_h_states = value_h_states.view(bsz, q_len, num_groups, fused_group_dim).transpose(1, 2)
         cache_size_k = (args.batch_size, num_groups, args.prompt_len, group_dim_k)
