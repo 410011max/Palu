@@ -51,15 +51,15 @@ def _abx_fwd(
     BLOCK_SIZE_D: tl.constexpr,
     BLOCK_SIZE_R: tl.constexpr,
     BLOCK_SIZE_L: tl.constexpr,
-    num_groups: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
     RBE_EPILOGUE: tl.constexpr,
     THETA: tl.constexpr,
 ):
     pid_h = tl.program_id(axis=0)  # number of heads
     pid_l = tl.program_id(axis=1)  # nubmer of block along seq_length dimension
     
-    # Assuming num_groups = 4, then pid_h = 0, 1, 2, 3 will be assigned to head group 0
-    HEAD_GROUPS_ID = pid_h // (32 // num_groups) 
+    # Assuming NUM_GROUPS = 4, then pid_h = 0, 1, 2, 3 will be assigned to head group 0
+    HEAD_GROUPS_ID = pid_h // (32 // NUM_GROUPS) 
     offs_ds = tl.arange(0, BLOCK_SIZE_D) # same as offs_bds
     offs_rs  = tl.arange(0, BLOCK_SIZE_R)
     offs_ls = (pid_l * BLOCK_SIZE_L) + tl.arange(0, BLOCK_SIZE_L)
@@ -125,7 +125,7 @@ def abx(a: torch.Tensor, b: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     # BLOCK_SIZE_L = 128
     # num_stages = 1
     # num_warps = 8
-    num_groups = num_groups
+    NUM_GROUPS = num_groups
     
     grid = lambda META: (32, triton.cdiv(seq_len, META["BLOCK_SIZE_L"]))
     #grid = lambda META: (triton.cdiv(seq_len, BLOCK_SIZE_L), 32)
@@ -144,7 +144,7 @@ def abx(a: torch.Tensor, b: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         # BLOCK_SIZE_R = BLOCK_SIZE_R,
         # num_stages=num_stages,
         # num_warps=num_warps,
-        num_groups = num_groups,
+        NUM_GROUPS = NUM_GROUPS,
         RBE_EPILOGUE = 1,
         THETA = 10000.,
     )
@@ -241,10 +241,9 @@ def run_test(args):
     device = "cuda"
     
     A = torch.randn(num_heads, 1, head_dim, dtype=dtype, device=device)
-    # Ar = rotate_half(A)
     B = torch.randn(num_heads, rank_per_groups, head_dim, dtype=dtype, device=device)
     X = torch.randn(num_groups, seq_len, rank_per_groups, dtype=dtype, device=device)
-    print(A.dtype)
+
     x, xb, xb_rope, xb_rope_0, xb_rope_1, axb, cos, sin, freqs = torch_abx(A, B, X)
     # ours, debug = abx(A, B, X)
     ours = abx(A, B, X)

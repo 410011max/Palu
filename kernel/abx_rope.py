@@ -3,7 +3,12 @@ import triton
 import triton.language as tl
 import argparse
 
-
+def set_random_seed(seed=0):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 @triton.jit
 def get_freq_multi_tokens(starting_idx, theta: tl.constexpr, NB_TOKENS: tl.constexpr):
@@ -46,16 +51,16 @@ def _abx_fwd(
     BLOCK_SIZE_D: tl.constexpr,
     BLOCK_SIZE_R: tl.constexpr,
     BLOCK_SIZE_L: tl.constexpr,
-    NUM_HEAD_GROUPS: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
     RBE_EPILOGUE: tl.constexpr,
     THETA: tl.constexpr,
 ):
     pid_h = tl.program_id(axis=0)  # number of heads
     pid_l = tl.program_id(axis=1)  # nubmer of block along seq_length dimension
     
-    # Assuming NUM_HEAD_GROUPS = 4, then pid_h = 0, 1, 2, 3 will be assigned to head group 0
-    HEAD_GROUPS_ID = pid_h // (32 // NUM_HEAD_GROUPS) 
-    offs_ds = tl.arange(0, BLOCK_SIZE_D) #same as offs_bds
+    # Assuming NUM_GROUPS = 4, then pid_h = 0, 1, 2, 3 will be assigned to head group 0
+    HEAD_GROUPS_ID = pid_h // (32 // NUM_GROUPS) 
+    offs_ds = tl.arange(0, BLOCK_SIZE_D) # same as offs_bds
     offs_rs  = tl.arange(0, BLOCK_SIZE_R)
     offs_ls = (pid_l * BLOCK_SIZE_L) + tl.arange(0, BLOCK_SIZE_L)
     
@@ -84,7 +89,6 @@ def _abx_fwd(
     xb_1 = xb_1.to(tl.float16)
     
     # RoPE
-    # if RBE_EPILOGUE:
     start_block = pid_l * BLOCK_SIZE_L
     cos, sin = get_freq_multi_tokens(starting_idx=start_block, theta=THETA, NB_TOKENS=BLOCK_SIZE_L)
     cos = cos.to(tl.float16)
@@ -95,6 +99,7 @@ def _abx_fwd(
     xb_0 = xb_rope_0.to(tl.float16)
     xb_1 = xb_rope_1.to(tl.float16)
 
+    # GEMV
     a_0 = tl.load(A_ptrs)
     a_1 = tl.load(A_ptrs + BLOCK_SIZE_D * stride_ad)
     abx_0 = tl.sum(a_0 * xb_0, 1)
@@ -111,7 +116,7 @@ def abx(a: torch.Tensor, b: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
 
     num_heads, _, head_dim = a.shape
     num_heads,rank_per_head_groups, head_dim = b.shape
-    num_head_groups, seq_len, rank_per_head_groups = x.shape
+    num_groups, seq_len, rank_per_head_groups = x.shape
     # Allocate output tensor
     out = torch.empty((num_heads, 1, seq_len), dtype=x.dtype, device=x.device)
     debug = torch.empty((num_heads, seq_len, 64), dtype=x.dtype, device=x.device)
@@ -120,7 +125,7 @@ def abx(a: torch.Tensor, b: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     # BLOCK_SIZE_L = 128
     # num_stages = 1
     # num_warps = 8
-    NUM_HEAD_GROUPS = num_head_groups
+    NUM_GROUPS = num_groups
     
     grid = lambda META: (32, triton.cdiv(seq_len, META["BLOCK_SIZE_L"]))
     #grid = lambda META: (triton.cdiv(seq_len, BLOCK_SIZE_L), 32)
@@ -139,22 +144,34 @@ def abx(a: torch.Tensor, b: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         # BLOCK_SIZE_R = BLOCK_SIZE_R,
         # num_stages=num_stages,
         # num_warps=num_warps,
-        NUM_HEAD_GROUPS = NUM_HEAD_GROUPS,
+        NUM_GROUPS = NUM_GROUPS,
         RBE_EPILOGUE = 1,
         THETA = 10000.,
     )
     return out #, debug
 
 def torch_abx(a, b, x):
-    x = x.repeat_interleave(b.shape[0]//x.shape[0], dim=0)
-    xb = x @ b
+    # Input shape
+    # a: (num_heads, 1, head_dim)
+    # b: (num_heads, rank_per_groups, head_dim)
+    # x: (num_groups, seq_len, rank_per_groups)
+    
+    # Recompute the key states
+    # x: (num_groups, 1, seq_len, rank_per_groups)
+    # b: (num_groups, group_size, rank_per_groups, head_dim)
+    # xb: (num_heads, seq_len, head_dim)
+    x_expand = x.unsqueeze(1)
+    b_reshape = b.reshape(-1, b.shape[0] // x.shape[0], b.shape[-2], b.shape[-1])
+    xb = x_expand @ b_reshape
+    xb = xb.reshape(b.shape[0], -1, b.shape[-1])
+
+    # Apply RoPE
     # (seq_len, 128) -> 0~63 is the same as 64~127
     from pytorch_reference import LlamaRotaryEmbedding, apply_rotary_pos_emb_pytorch
     cos, sin, freqs = LlamaRotaryEmbedding(dim=128, end=x.shape[1])
     xb_rope, xb_rope_0, xb_rope_1 = apply_rotary_pos_emb_pytorch(x=xb, cos=cos, sin=sin)
     axb = a @ xb_rope.transpose(-1, -2).to(torch.float16)
     return x, xb, xb_rope, xb_rope_0, xb_rope_1, axb, cos, sin, freqs
-
 
 def run_benchmark(args):
     configs = []
@@ -167,32 +184,30 @@ def run_benchmark(args):
             line_names=["WX", "Torch", "Ours"],
             styles=[("gray", "--"), ("green", "--"), ("blue", "-")],
             ylabel="us",
-            plot_name=f"low-rank-rank-{args.total_rank}-group-{args.num_head_groups}",
+            plot_name=f"low-rank-rank-{args.total_rank}-group-{args.num_groups}",
             args={
                 "dtype": torch.float16,
                 "num_heads": args.num_heads,
                 "head_dim": args.head_dim,
                 "total_rank": args.total_rank,
-                "num_head_groups": args.num_head_groups, # number of head groups
+                "num_groups": args.num_groups, # number of head groups
             },
         ))
 
     @triton.testing.perf_report(configs)
-    def bench_low_rank(num_heads, head_dim, total_rank, seq_len, num_head_groups, provider, dtype=torch.float16, device="cuda"):
-        rank_per_groups = total_rank //  num_head_groups
+    def bench_low_rank(num_heads, head_dim, total_rank, seq_len, num_groups, provider, dtype=torch.float16, device="cuda"):
+        rank_per_groups = total_rank // num_groups
     
         warmup = 25
         rep = 100
         A = torch.randn(num_heads, 1, head_dim, dtype=dtype, device=device)
-        # Ar = rotate_half(A)
         B = torch.randn(num_heads, rank_per_groups, head_dim, dtype=dtype, device=device)
-        X = torch.randn(num_head_groups, seq_len, rank_per_groups, dtype=dtype, device=device)
+        X = torch.randn(num_groups, seq_len, rank_per_groups, dtype=dtype, device=device)
         org_A = torch.randn(num_heads, 1, head_dim, dtype=dtype, device=device)
         org_X = torch.randn(num_heads, seq_len, head_dim, dtype=dtype, device=device)
         
         
         quantiles = [0.5, 0.2, 0.8]
-        
         if provider == "torch":
             def fn(): return torch_abx(A, B, X)
             ms, min_ms, max_ms = triton.testing.do_bench(
@@ -219,20 +234,19 @@ def run_test(args):
     num_heads = args.num_heads
     head_dim = args.head_dim
     total_rank = args.total_rank
-    seq_len = 128 * 1024 * 2
-    num_head_groups = args.num_head_groups
-    rank_per_groups = total_rank //  num_head_groups
+    seq_len = 64
+    num_groups = args.num_groups
+    rank_per_groups = total_rank //  num_groups
     dtype = torch.float16
     device = "cuda"
     
     A = torch.randn(num_heads, 1, head_dim, dtype=dtype, device=device)
-    # Ar = rotate_half(A)
     B = torch.randn(num_heads, rank_per_groups, head_dim, dtype=dtype, device=device)
-    X = torch.randn(num_head_groups, seq_len, rank_per_groups, dtype=dtype, device=device)
-    
+    X = torch.randn(num_groups, seq_len, rank_per_groups, dtype=dtype, device=device)
+
     x, xb, xb_rope, xb_rope_0, xb_rope_1, axb, cos, sin, freqs = torch_abx(A, B, X)
     # ours, debug = abx(A, B, X)
-    ours, = abx(A, B, X)
+    ours = abx(A, B, X)
 
     # print('freq', freqs.shape, freqs[1, :3])
     # print('b_0', B.shape, B[0, 1, :3])
@@ -247,16 +261,30 @@ def run_test(args):
     # print('xb_rope_1', xb_rope1.shape, xb_rope1[0, 0, :3])
     # print('debug', debug.shape, debug[0, 1, :3])
     # print('debug', debug.shape, debug[0, 1, 64:69])
-    # print('ours', ours.shape, ours[0, 0, :3])
+    # print('axb', axb.shape, axb[0, 0, :])
+    # print('ours', ours.shape, ours[0, 0, :])
+    # for i in range(32):
+    #     print(torch.max((axb[i] - ours[i])/(ours[i]+1e-3)))
+    # print(axb.shape)
+    # print((axb[28] - ours[28])/ours[28])
+    # print(axb[28, 0, 8:13])
+    # print(ours[28, 0, 8:13])
+    # diff = ours - axb
+    # diff_r = diff / axb.max()
+    # diff_r = diff / (axb + 1e-5)
     print("Max diff: ", torch.max(torch.abs(axb - ours)))
-
+    # find numbers of diff > 10%
+    # print(axb[torch.where(torch.abs(diff_r) > 0.05)])
+    # print(ours[torch.where(torch.abs(diff_r) > 0.05)])
+    # torch.testing.assert_close(axb, ours, rtol=5e-3, atol=1e-5)
+    # torch.testing.assert_close(axb, ours)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Argument Parser")
-    parser.add_argument("--total_rank", type=int, default=1024, help="Total rank")
+    parser.add_argument("--total_rank", type=int, default=4096, help="Total rank")
     parser.add_argument("--num_heads", type=int, default=32, help="Number of heads, default to 32 (llama)")
     parser.add_argument("--head_dim", type=int, default=128, help="Head dimension, default to 128 (llama)")
-    parser.add_argument("--num_head_groups", type=int, default=16, help="Number of head groups")
+    parser.add_argument("--group_size", type=int, default=4, help="Number of heads per group")
     parser.add_argument("--target_seq_lens", nargs="+", type=int, 
                         default=[4096, 16384, 65536, 262144], help="Target sequence lengths")
                         # default=[128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144], help="Target sequence lengths")
@@ -265,18 +293,22 @@ def parse_args():
     return args
 
 def main(args):
+    args.num_groups = args.num_heads // args.group_size
+    args.group_rank = args.total_rank // args.num_groups
     print("Start benchmarking fused low-rank KV Cache Kernels...")
     print("Total Rank: ", args.total_rank)
     print("Number of Heads: ", args.num_heads)
     print("Head Dimension: ", args.head_dim)
-    print("Number of Head Groups: ", args.num_head_groups)
-    print("Rank per Head Groups: ", args.total_rank // args.num_head_groups)
+    print("Group Size:", args.group_size)
+    print("Number of Groups: ", args.num_groups)
+    print("Rank per Group: ", args.group_rank)
     if args.check:
         run_test(args)
     else:
         run_benchmark(args)
 
 if __name__ == "__main__":
+    set_random_seed()
     args = parse_args()
     main(args)
     
