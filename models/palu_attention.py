@@ -4,7 +4,6 @@ from typing import Optional, Tuple
 
 import torch
 from torch import nn
-import torch.nn.functional as F
 
 from transformers.models.llama.modeling_llama import (
     Cache, apply_rotary_pos_emb, 
@@ -16,7 +15,7 @@ from kernel.abx_rope import abx as recompute_k_gemv
 
 class HeadwiseLowRankModule(nn.Module):
     """ Headwise Low-Rank module """
-    def __init__(self, ranks, in_features, out_features, bias):
+    def __init__(self, ranks, in_features, out_features, bias, config=None):
         super().__init__()
 
         self.ranks = ranks
@@ -42,6 +41,18 @@ class HeadwiseLowRankModule(nn.Module):
 
         self.U_list = nn.ModuleList(Us)
     
+        if config is not None:
+            num_heads = config.num_key_value_heads
+            group_size = config.group_size
+            head_dim = config.hidden_size // num_heads
+            # Create B matrix for kernel
+            U_list_T = [x.weight.data.T for x in self.U_list]
+            b = torch.stack(U_list_T)
+            b = b.reshape(self.num_groups, self.ranks[0], group_size, head_dim)
+            b = b.transpose(1, 2)
+            b = b.reshape(num_heads, self.ranks[0], head_dim)
+            self.B = nn.Parameter(b)
+
     def forward(self, hidden_states: torch.Tensor):
         """ hidden_states: Tensor of shape (batch_size, seq_len, in_features) """
         assert hidden_states.dim() == 3, f"hidden_states should have 3 dimensions, got {hidden_states.dim()}"
@@ -105,15 +116,13 @@ class HeadwiseLowRankModule(nn.Module):
                 raise ValueError(f"{new_module.U_list[i].weight.data.shape} != {wl[i].shape}")
             new_module.U_list[i].weight.data = wl[i].contiguous()
         
-        # Final b
-        if attn_module is not None:
-            # FIXME: use group_rank & head_dim & group_size
-            U_list_T = [x.weight.data.T for x in new_module.U_list]
-            b = torch.stack(U_list_T)
-            b = b.reshape(new_module.num_groups, new_module.ranks[0], attn_module.group_size, attn_module.head_dim)
-            b = b.transpose(1, 2)
-            b = b.reshape(attn_module.num_heads, new_module.ranks[0], attn_module.head_dim)
-            new_module.B = nn.Parameter(b)
+        # Create B matrix for kernel
+        U_list_T = [x.weight.data.T for x in new_module.U_list]
+        b = torch.stack(U_list_T)
+        b = b.reshape(new_module.num_groups, new_module.ranks[0], attn_module.group_size, attn_module.head_dim)
+        b = b.transpose(1, 2)
+        b = b.reshape(attn_module.num_heads, new_module.ranks[0], attn_module.head_dim)
+        new_module.B = nn.Parameter(b)
 
         # load to VT
         # shape (sum(ranks), hidden_size)
@@ -150,8 +159,8 @@ class LlamaPaluAttention(LlamaAttention):
         
         self.rank_k_list = [self.group_rank_k for _ in range(self.num_groups)]
         self.rank_v_list = [self.group_rank_v for _ in range(self.num_groups)]
-        self.k_proj = HeadwiseLowRankModule(self.rank_k_list, self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
-        self.v_proj = HeadwiseLowRankModule(self.rank_v_list, self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
+        self.k_proj = HeadwiseLowRankModule(self.rank_k_list, self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias, config=config)
+        self.v_proj = HeadwiseLowRankModule(self.rank_v_list, self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias, config=config)
         # self.v_proj = nn.Linear(self.hidden_size, self.total_rank_v, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.fused_hidden_dim_o, self.hidden_size, bias=config.attention_bias)
         
@@ -259,9 +268,7 @@ class LlamaPaluAttention(LlamaAttention):
             X = key_h_states.squeeze(0)
             attn_weights = recompute_k_gemv(A, B, X).unsqueeze(0) / math.sqrt(self.head_dim)
 
-
         # attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-        # return key_states, attn_weights, query_states
 
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
@@ -289,9 +296,7 @@ class LlamaPaluAttention(LlamaAttention):
         # Fusion version
         # attn_weights: (bsz, num_groups, q_len * group_size, kv_seq_len)
         attn_h_weights = attn_weights.reshape(1, self.num_groups, q_len * self.group_size, kv_seq_len)
-
         attn_h_output = torch.matmul(attn_h_weights, value_h_states)
-
         # attn_h_output: (bsz, num_heads, q_len * group_size, group_rank)
         attn_output = attn_h_output.reshape(1, self.num_heads, q_len, self.group_rank_v)
 
@@ -316,20 +321,17 @@ class LlamaPaluAttention(LlamaAttention):
         new_module = LlamaPaluAttention(config, module.layer_idx)
         new_module.q_proj = module.q_proj
         new_module.k_proj = HeadwiseLowRankModule.from_linear(module.k_proj, new_module.rank_k_list, new_module)
+        new_module.v_proj = HeadwiseLowRankModule.from_linear(module.v_proj, new_module.rank_v_list)
 
-        # Decompose and fuse v_proj and o_proj
-        rank_v_list = [config.total_rank_v // config.num_groups for _ in range(config.num_groups)]
-        new_v_proj = HeadwiseLowRankModule.from_linear(module.v_proj, rank_v_list)
-
-        # No fusing version
+        # No fusion version
         if no_fusion:
-            new_module.v_proj = new_v_proj
             new_module.o_proj = module.o_proj
             return new_module
 
-        # Fusing version
+        # Fusion version
         # new_module.v_proj = new_v_proj.VT
-        new_module.v_proj = new_v_proj
+
+        # fuse v_proj.U into o_proj
         new_o_weight = torch.zeros(new_module.o_proj.weight.size())
 
         head_dim = module.head_dim
@@ -343,7 +345,7 @@ class LlamaPaluAttention(LlamaAttention):
             for _ in range(group_size):
                 new_o_weight[:, total_fused_dims:total_fused_dims + group_rank] = \
                     module.o_proj.weight[:, total_dims_2:total_dims_2 + head_dim] @ \
-                    new_v_proj.U_list[i].weight[total_dims:total_dims + head_dim, :]
+                    new_module.v_proj.U_list[i].weight[total_dims:total_dims + head_dim, :]
                 total_dims += head_dim
                 total_dims_2 += head_dim
                 total_fused_dims += group_rank
