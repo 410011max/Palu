@@ -117,12 +117,13 @@ class HeadwiseLowRankModule(nn.Module):
             new_module.U_list[i].weight.data = wl[i].contiguous()
         
         # Create B matrix for kernel
-        U_list_T = [x.weight.data.T for x in new_module.U_list]
-        b = torch.stack(U_list_T)
-        b = b.reshape(new_module.num_groups, new_module.ranks[0], attn_module.group_size, attn_module.head_dim)
-        b = b.transpose(1, 2)
-        b = b.reshape(attn_module.num_heads, new_module.ranks[0], attn_module.head_dim)
-        new_module.B = nn.Parameter(b)
+        if attn_module is not None:
+            U_list_T = [x.weight.data.T for x in new_module.U_list]
+            b = torch.stack(U_list_T)
+            b = b.reshape(new_module.num_groups, new_module.ranks[0], attn_module.group_size, attn_module.head_dim)
+            b = b.transpose(1, 2)
+            b = b.reshape(attn_module.num_heads, new_module.ranks[0], attn_module.head_dim)
+            new_module.B = nn.Parameter(b)
 
         # load to VT
         # shape (sum(ranks), hidden_size)
